@@ -236,7 +236,9 @@ class TsTable:
         if rows.__class__ == pandas.core.frame.DataFrame:
             if rows.empty:
                 return # Do nothing if we are appending nothing
-            if rows.index.__class__ != pandas.tseries.index.DatetimeIndex:
+
+            # Fixed Bug with pandas version 0.20+
+            if rows.index.__class__ != pandas.core.indexes.datetimes.DatetimeIndex:
                 raise ValueError('when rows is a DataFrame, the index must be a DatetimeIndex.')
 
             # Convert to records
