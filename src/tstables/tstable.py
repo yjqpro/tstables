@@ -242,7 +242,7 @@ class TsTable:
                 raise ValueError('when rows is a DataFrame, the index must be a DatetimeIndex.')
 
             # Convert to records
-            records = rows.to_records(index=True,convert_datetime64=False)
+            records = rows.to_records(index=True)
 
             # Need to make two type conversions:
             # 1. Pandas stores strings internally as variable-length strings, which are converted to objects in NumPy
