@@ -337,6 +337,8 @@ class TsTable:
         are valid for this partition.
         """
 
+        if len(rows) == 0:
+            return
         ts_data = self.__fetch_or_create_partition_table(partition_dt)
         ts_data.append(rows)
     
