@@ -35,6 +35,8 @@ class TsTalbeMonthly:
         The rows argument is assumed to be sorted and *only* contain rows that have timestamps that
         are valid for this partition.
         """
+        if len(rows) == 0:
+            return
 
         ts_data = self.__fetch_or_create_partition_table(partition_dt)
         ts_data.append(rows)
