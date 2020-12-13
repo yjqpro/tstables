@@ -1,10 +1,96 @@
 import pytz
+import os
 import datetime
 import tables
 import numpy
 import numpy.lib.recfunctions
 import pandas
 import re
+import calendar
+from dateutil.relativedelta import relativedelta
+
+class TsTalbeMonthly:
+    def __init__(self, pt_file, root_group, description,title="",filters=None,
+        expectedrows_per_partition=10000,chunkshape=None,byteorder=None):
+        self.file = pt_file
+        self.root_group = root_group
+        self.table_description = description
+        self.table_title = title
+        self.table_filters = filters
+        self.table_expectedrows = expectedrows_per_partition
+        self.table_chunkshape = chunkshape 
+        self.table_byteorder = byteorder
+
+    @staticmethod
+    def __partition_date_to_path_array(partition_dt):
+        """Converts a partition date to an array of partition names
+        """
+
+        return [partition_dt.strftime('y%Y'),partition_dt.strftime('m%m'),partition_dt.strftime('d%d')]
+
+
+    def append_rows_to_partition(self,partition_dt,rows):
+        """Appends rows to a partition (which might not exist yet, and will then be created)
+
+        The rows argument is assumed to be sorted and *only* contain rows that have timestamps that
+        are valid for this partition.
+        """
+
+        ts_data = self.__fetch_or_create_partition_table(partition_dt)
+        ts_data.append(rows)
+    
+    def __fetch_partition_group(self,partition_dt):
+        """Fetches a partition group, or returns `False` if the partition group does not exist
+        """
+
+        try:
+            p_array = self.__partition_date_to_path_array(partition_dt)
+            return self.root_group._f_get_child(p_array[0])._f_get_child(p_array[1])._f_get_child(p_array[2])
+        except (KeyError,tables.NoSuchNodeError):
+            return False
+
+    def __create_partition(self,partition_dt):
+        """Creates partition, including parent groups (if they don't exist) and the data table
+        """
+
+        p_array = self.__partition_date_to_path_array(partition_dt)
+        
+        """
+        # For each component, fetch the group or create it
+        # Year
+        try:
+            y_group = self.root_group._f_get_child(p_array[0])
+        except tables.NoSuchNodeError:
+            y_group = self.file.create_group(self.root_group,p_array[0])
+
+        # Month
+        try:
+            m_group = y_group._f_get_child(p_array[1])
+        except tables.NoSuchNodeError:
+            m_group = self.file.create_group(y_group,p_array[1])
+
+        """
+        # Day
+        try:
+            d_group = self.root_group._f_get_child(p_array[2])
+        except tables.NoSuchNodeError:
+            d_group = self.file.create_group(self.root_group,p_array[2])
+
+        # We need to create the table in the day group
+        ts_data = self.file.create_table(d_group,'ts_data',self.table_description,self.table_title,
+            self.table_filters, self.table_expectedrows, self.table_chunkshape, self.table_byteorder)
+
+        # Need to save this as an attribute because it doesn't seem to be saved anywhere
+        ts_data.attrs._TS_TABLES_EXPECTEDROWS_PER_PARTITION = self.table_expectedrows
+
+        return ts_data
+
+    def __fetch_or_create_partition_table(self,partition_dt):
+        group = self.__fetch_partition_group(partition_dt)
+        if group:
+            return group._f_get_child('ts_data')
+        else:
+            return self.__create_partition(partition_dt)
 
 class TsTable:
     EPOCH = datetime.datetime(1970,1,1,tzinfo=pytz.utc)
@@ -15,16 +101,20 @@ class TsTable:
     # The maximum partition size to read completely into memory before using Table.read_where.
     MAX_FULL_PARTITION_READ_SIZE = 25*1e6
 
-    def __init__(self,pt_file,root_group,description,title="",filters=None,
+    def __init__(self,rootdir, file_name_prefix, description,where, name, title="",filters=None,
         expectedrows_per_partition=10000,chunkshape=None,byteorder=None):
-        self.file = pt_file
-        self.root_group = root_group
+        # self.file = pt_file
+        # self.root_group = root_group
+        self.file_name_prefix = file_name_prefix
+        self.rootdir = rootdir
         self.table_description = description
         self.table_title = title
         self.table_filters = filters
         self.table_expectedrows = expectedrows_per_partition
         self.table_chunkshape = chunkshape
         self.table_byteorder = byteorder
+        self.where = where
+        self.name = name
 
     @classmethod
     def __tsrange_to_partition_ranges(self,start_ts,end_ts):
@@ -250,7 +340,7 @@ class TsTable:
             #    set to True.
             # 2. Need to convert the timestamp to datetime64[ms] (milliseconds)
 
-            dest_dtype = self.__fetch_first_table().description._v_dtype
+            dest_dtype = tables.description.dtype_from_descr(self.table_description)
 
             new_descr = []
             existing_descr = records.dtype.descr
@@ -275,7 +365,7 @@ class TsTable:
             if iflavor != 'python':
                 rows = tables.flavor.array_as_internal(rows,iflavor)
 
-            wbufRA = numpy.rec.array(rows, dtype=self.__fetch_first_table().description._v_dtype)
+            wbufRA = numpy.rec.array(rows, dtype=tables.description.dtype_from_descr(self.table_description))
         except Exception as exc:
             raise ValueError("rows parameter cannot be converted into a recarray object compliant "
                              "with table '%s'.  The error was: <%s>" % (str(self), exc))
@@ -294,9 +384,9 @@ class TsTable:
         max_ts = wbufRA[-1][0]
 
         # Confirm that min is >= to the TsTable's max_ts
-        if min_ts < (self.__get_max_ts() or numpy.iinfo('int64').min):
-            raise ValueError("rows start prior to the end of existing rows, so they cannot be "
-                             "appended.")
+        # if min_ts < (self.__get_max_ts() or numpy.iinfo('int64').min):
+            # raise ValueError("rows start prior to the end of existing rows, so they cannot be "
+                             # "appended.")
 
         # wbufRA is ready to be inserted at this point. Chop it up into partitions.
         min_dt = self.__ts_to_dt(min_ts)
@@ -319,89 +409,34 @@ class TsTable:
         # Now, split the array
         split_wbufRA = numpy.split(wbufRA,split_on_idx)
 
+        if not os.path.exists(self.rootdir):
+            os.mkdir(self.rootdir)
+
+        # min_dt
+        start_month_dt = datetime.datetime(min_dt.date().year, min_dt.date().month, 1)
+        _, end_dt_month_last_date = calendar.monthrange(max_dt.date().year, max_dt.date().month)
+
+        year_month = start_month_dt.strftime('y%Y_m%m')
+        
+        f = tables.open_file(os.path.join(self.rootdir, f'{self.file_name_prefix}_{year_month}.h5'), 'a')
+        # The parent node of the time series
+        tsnode = f.create_group(self.where,  self.name, self.table_title, None,False)
+        tsnode._v_attrs._YEAR = start_month_dt.strftime('%Y')
+        tsnode._v_attrs._MONTH = start_month_dt.strftime('%m')
+        ts = TsTalbeMonthly(f, tsnode, self.table_description, filters=self.table_filters)
+
         # Save each partition
         for idx,p in enumerate(sorted_pkeys):
-            self.__append_rows_to_partition(p,split_wbufRA[idx])
+            next_month_dt = start_month_dt + relativedelta(months=1)
+            if p >= next_month_dt.date():
+                f.close()
+                start_month_dt = next_month_dt
+                year_month = start_month_dt.strftime('y%Y_m%m')
 
-    @staticmethod
-    def __partition_date_to_path_array(partition_dt):
-        """Converts a partition date to an array of partition names
-        """
+                f = tables.open_file(os.path.join(self.rootdir, f'{self.file_name_prefix}_{year_month}.h5'), 'a')
+                tsnode = f.create_group(self.where, self.name, self.table_title, None,False)
+                ts = TsTalbeMonthly(f, tsnode, self.table_description, filters=self.table_filters)
 
-        return [partition_dt.strftime('y%Y'),partition_dt.strftime('m%m'),partition_dt.strftime('d%d')]
+            ts.append_rows_to_partition(p,split_wbufRA[idx])
+        f.close()
 
-    def __append_rows_to_partition(self,partition_dt,rows):
-        """Appends rows to a partition (which might not exist yet, and will then be created)
-
-        The rows argument is assumed to be sorted and *only* contain rows that have timestamps that
-        are valid for this partition.
-        """
-
-        ts_data = self.__fetch_or_create_partition_table(partition_dt)
-        ts_data.append(rows)
-    
-    def __fetch_partition_group(self,partition_dt):
-        """Fetches a partition group, or returns `False` if the partition group does not exist
-        """
-
-        try:
-            p_array = self.__partition_date_to_path_array(partition_dt)
-            return self.root_group._f_get_child(p_array[0])._f_get_child(p_array[1])._f_get_child(p_array[2])
-        except (KeyError,tables.NoSuchNodeError):
-            return False
-
-    def __create_partition(self,partition_dt):
-        """Creates partition, including parent groups (if they don't exist) and the data table
-        """
-
-        p_array = self.__partition_date_to_path_array(partition_dt)
-        
-        # For each component, fetch the group or create it
-        # Year
-        try:
-            y_group = self.root_group._f_get_child(p_array[0])
-        except tables.NoSuchNodeError:
-            y_group = self.file.create_group(self.root_group,p_array[0])
-
-        # Month
-        try:
-            m_group = y_group._f_get_child(p_array[1])
-        except tables.NoSuchNodeError:
-            m_group = self.file.create_group(y_group,p_array[1])
-
-        # Day
-        try:
-            d_group = m_group._f_get_child(p_array[2])
-        except tables.NoSuchNodeError:
-            d_group = self.file.create_group(m_group,p_array[2])
-
-        # We need to create the table in the day group
-        ts_data = self.file.create_table(d_group,'ts_data',self.table_description,self.table_title,
-            self.table_filters, self.table_expectedrows, self.table_chunkshape, self.table_byteorder)
-
-        # Need to save this as an attribute because it doesn't seem to be saved anywhere
-        ts_data.attrs._TS_TABLES_EXPECTEDROWS_PER_PARTITION = self.table_expectedrows
-
-        return ts_data
-
-    def __fetch_or_create_partition_table(self,partition_dt):
-        group = self.__fetch_partition_group(partition_dt)
-        if group:
-            return group._f_get_child('ts_data')
-        else:
-            return self.__create_partition(partition_dt)
-
-
-
-
-
-
-        
-
-
-
-
-
-
-
-    
